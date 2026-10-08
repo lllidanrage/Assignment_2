@@ -2,6 +2,12 @@
 /input
 /result
 
+# build
+/build*
+
+# report
+*.pdf
+
 # claude
 /CLAUDE.md
 .claude

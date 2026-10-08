@@ -9,6 +9,7 @@ std::int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start,
         .count();
 }
 }
+
 // Project 2: word counting and character splitting over every rank, combined
 // into the global result (rule R1.2).
 void parallel_task1(std::vector<Byte>& input, Results& results) {
@@ -20,6 +21,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     LOG(INFO) << "split words: " << elapsed_ms(t0, t1) << " ms";
     task1(words, results);
 }
+
 // Project 2, Task 2: every round the ranks agree on the same 256 most frequent
 // eligible pairs, counted over ALL ranks, and each rank then merges its own
 // occurrences of those 256 before the next round selects again (rule R1.2).
