@@ -59,7 +59,7 @@ ifeq ($(shell test -d /usr/local/opt/libomp && echo yes),yes)
 OMP_DIR := /usr/local/opt/libomp
 endif
 OPENMP_FLAGS := -Xpreprocessor -fopenmp -I$(OMP_DIR)/include
-OPENMP_LIBS := -L$(OMP_DIR)/lib -lomp
+OPENMP_LIBS := -L$(OMP_DIR)/lib -lomp -framework CoreFoundation
 THREAD_FLAG := -pthread
 EXE :=
 TIME_CMD := time

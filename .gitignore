@@ -11,3 +11,12 @@
 # claude
 /CLAUDE.md
 .claude
+
+# generated outputs
+/bin/
+/output.txt
+/seq.txt
+/task1_timing.txt
+
+# local abseil fix
+/abseil/absl/synchronization/internal/pthread_waiter.cc
