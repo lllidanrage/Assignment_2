@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=30
 #SBATCH --time=06:00:00
 #SBATCH --mem=120G
-#SBATCH --partition=physical
+#SBATCH --partition=sapphire
 #SBATCH --chdir=/home/jingchuh/Assignment_2
 
 # Benchmarks the four graded configurations and writes results.csv.
