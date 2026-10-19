@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <omp.h>
@@ -45,13 +46,13 @@ std::vector<Byte> pack_word_counts(const std::vector<WordCount>& wcs) {
 
 // Write per-rank step timings to task1_timing.txt.
 // local_times layout (one row per rank, NSTEPS columns):
-//   [scatter, split_words, word_count, allgatherv, merge_sort, build_results]
+//   [scatter, split_words, word_count, allgatherv, merge, sort, build_results]
 void write_timing(int rank, int nranks,
                   const std::vector<std::int64_t>& local_times) {
-    constexpr int NSTEPS = 6;
+    constexpr int NSTEPS = 7;
     static const char* NAMES[NSTEPS] = {
         "scatter      ", "split_words  ", "word_count   ",
-        "allgatherv   ", "merge+sort   ", "build_results"};
+        "allgatherv   ", "merge        ", "sort         ", "build_results"};
 
 #ifdef BPE_HAVE_MPI
     std::vector<std::int64_t> all_times(nranks * NSTEPS);
@@ -65,7 +66,10 @@ void write_timing(int rank, int nranks,
 #endif
 
     if (rank == 0) {
-        std::ofstream f("task1_timing.txt");
+        const char* job_id = std::getenv("SLURM_JOB_ID");
+        std::string fname =
+            std::string("timing-") + (job_id ? job_id : "local") + ".txt";
+        std::ofstream f(fname, std::ios::app);
         for (int r = 0; r < nranks; ++r) {
             f << "=== rank " << r << " of " << nranks << " ===\n";
             std::int64_t total = 0;
@@ -90,8 +94,8 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     const int nranks = 1;
 #endif
 
-    // per-step wall times: scatter / split / count / allgather / merge / build
-    std::vector<std::int64_t> step_ms(6, 0);
+    // per-step wall times: scatter / split / count / allgather / merge / sort / build
+    std::vector<std::int64_t> step_ms(7, 0);
 
     // -------------------------------------------------------------------------
     // Step 1: scatter corpus shards (word-boundary aligned)
@@ -229,12 +233,15 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
         }
     }
 
+    step_ms[4] = elapsed_ms(tp, std::chrono::steady_clock::now());
+    tp = std::chrono::steady_clock::now();
+
     std::vector<std::pair<std::string, std::size_t>> sorted_global(
         global_map.begin(), global_map.end());
     std::sort(sorted_global.begin(), sorted_global.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    step_ms[4] = elapsed_ms(tp, std::chrono::steady_clock::now());
+    step_ms[5] = elapsed_ms(tp, std::chrono::steady_clock::now());
 
     // -------------------------------------------------------------------------
     // Step 6: build results
@@ -284,7 +291,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     }
 #endif
 
-    step_ms[5] = elapsed_ms(tp, std::chrono::steady_clock::now());
+    step_ms[6] = elapsed_ms(tp, std::chrono::steady_clock::now());
 
     write_timing(rank, nranks, step_ms);
 }

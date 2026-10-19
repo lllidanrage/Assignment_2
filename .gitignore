@@ -16,7 +16,7 @@
 /bin/
 /output.txt
 /seq.txt
-/task1_timing.txt
+/timing-*.txt
 /slurm-*.out
 /results.csv
 
