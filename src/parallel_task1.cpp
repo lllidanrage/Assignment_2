@@ -381,8 +381,4 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     write_timing(rank, nranks, step_ms);
 }
 
-void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
-    task2(splits, results);
-}
-
 }  // namespace bpe
