@@ -220,11 +220,27 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     // -------------------------------------------------------------------------
     tp = std::chrono::steady_clock::now();
 
-    // Split 0-127 evenly across ranks; last rank extends to 255 to catch
-    // all non-ASCII bytes without giving them a dedicated rank.
-    const int bytes_per_rank = (128 + nranks - 1) / nranks;
-    const int range_start    = rank * bytes_per_rank;
-    const int range_end      = (rank == nranks - 1) ? 256 : range_start + bytes_per_rank;
+    // Split 52 English letters (A-Z:65-90, a-z:97-122) evenly across ranks.
+    // Non-letter bytes fall into whichever contiguous range covers them.
+    // The Z/a gap (91-96) stays with Z's rank (boundary pushed to 97).
+    const int total_letters    = 52;
+    const int letters_per_rank = (total_letters + nranks - 1) / nranks;
+
+    auto letter_to_byte = [](int idx) -> int {
+        return idx < 26 ? 65 + idx : 97 + (idx - 26);
+    };
+
+    std::vector<int> boundary(nranks + 1);
+    boundary[0] = 0;
+    for (int r = 1; r < nranks; ++r) {
+        int last_letter = std::min(r * letters_per_rank, total_letters) - 1;
+        int last_byte   = letter_to_byte(last_letter);
+        boundary[r]     = (last_byte == 90) ? 97 : last_byte + 1;
+    }
+    boundary[nranks] = 256;
+
+    const int range_start = boundary[rank];
+    const int range_end   = boundary[rank + 1];
 
     // Merge only entries whose first byte falls in [range_start, range_end).
     std::unordered_map<std::string, std::size_t> partial_map;
