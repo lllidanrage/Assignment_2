@@ -44,15 +44,15 @@ std::vector<Byte> pack_word_counts(const std::vector<WordCount>& wcs) {
     return buf;
 }
 
-// Write per-rank step timings to task1_timing.txt.
+// Write per-rank step timings to timing-<job>.txt.
 // local_times layout (one row per rank, NSTEPS columns):
-//   [scatter, split_words, word_count, allgatherv, merge, sort, build_results]
+//   [scatter, split_words, word_count, allgatherv, merge, sort, allgatherv2, build_results]
 void write_timing(int rank, int nranks,
                   const std::vector<std::int64_t>& local_times) {
-    constexpr int NSTEPS = 7;
+    constexpr int NSTEPS = 8;
     static const char* NAMES[NSTEPS] = {
-        "scatter      ", "split_words  ", "word_count   ",
-        "allgatherv   ", "merge        ", "sort         ", "build_results"};
+        "scatter      ", "split_words  ", "word_count   ", "allgatherv   ",
+        "merge        ", "sort         ", "allgatherv2  ", "build_results"};
 
 #ifdef BPE_HAVE_MPI
     std::vector<std::int64_t> all_times(nranks * NSTEPS);
@@ -94,8 +94,8 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     const int nranks = 1;
 #endif
 
-    // per-step wall times: scatter / split / count / allgather / merge / sort / build
-    std::vector<std::int64_t> step_ms(7, 0);
+    // per-step wall times: scatter/split/count/allgather/merge/sort/allgather2/build
+    std::vector<std::int64_t> step_ms(8, 0);
 
     // -------------------------------------------------------------------------
     // Step 1: scatter corpus shards (word-boundary aligned)
@@ -212,11 +212,19 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     step_ms[3] = elapsed_ms(tp, std::chrono::steady_clock::now());
 
     // -------------------------------------------------------------------------
-    // Step 5: merge all ranks' word counts into a global sorted list
+    // Step 5: parallel merge+sort — each rank owns a disjoint byte-range slice
+    // of the global vocabulary, so the per-rank sort is O(V/N log(V/N)) and
+    // concatenating in rank order yields a globally sorted list.
     // -------------------------------------------------------------------------
     tp = std::chrono::steady_clock::now();
 
-    std::unordered_map<std::string, std::size_t> global_map;
+    // Partition the 256 first-byte values evenly across ranks.
+    const int bytes_per_rank = (256 + nranks - 1) / nranks;
+    const int range_start    = rank * bytes_per_rank;
+    const int range_end      = std::min(range_start + bytes_per_rank, 256);
+
+    // Merge only entries whose first byte falls in [range_start, range_end).
+    std::unordered_map<std::string, std::size_t> partial_map;
     for (int r = 0; r < nranks; ++r) {
         const Byte* p  = all_packed.data() + rcv_displs[r];
         const Byte* ep = p + rcv_counts[r];
@@ -224,27 +232,84 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
             uint32_t len;
             std::memcpy(&len, p, 4);
             p += 4;
-            std::string word(reinterpret_cast<const char*>(p), len);
+            const unsigned char first = static_cast<unsigned char>(p[0]);
+            const char* wptr = reinterpret_cast<const char*>(p);
             p += len;
             uint64_t cnt;
             std::memcpy(&cnt, p, 8);
             p += 8;
-            global_map[word] += static_cast<std::size_t>(cnt);
+            if (first >= range_start && first < range_end)
+                partial_map[std::string(wptr, len)] += static_cast<std::size_t>(cnt);
         }
     }
 
     step_ms[4] = elapsed_ms(tp, std::chrono::steady_clock::now());
     tp = std::chrono::steady_clock::now();
 
-    std::vector<std::pair<std::string, std::size_t>> sorted_global(
-        global_map.begin(), global_map.end());
-    std::sort(sorted_global.begin(), sorted_global.end(),
+    // Sort this rank's slice (size ≈ V/N).
+    std::vector<std::pair<std::string, std::size_t>> sorted_partial(
+        partial_map.begin(), partial_map.end());
+    std::sort(sorted_partial.begin(), sorted_partial.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
     step_ms[5] = elapsed_ms(tp, std::chrono::steady_clock::now());
+    tp = std::chrono::steady_clock::now();
 
     // -------------------------------------------------------------------------
-    // Step 6: build results
+    // Step 6: allgatherv sorted slices → concatenate in rank order = globally
+    //         sorted (no further sort needed because ranges are disjoint).
+    // -------------------------------------------------------------------------
+    // Pack this rank's sorted slice.
+    std::vector<Byte> packed_partial;
+    packed_partial.reserve(sorted_partial.size() * 16);
+    for (const auto& [word, count] : sorted_partial) {
+        uint32_t wlen = static_cast<uint32_t>(word.size());
+        packed_partial.insert(packed_partial.end(),
+                              reinterpret_cast<const Byte*>(&wlen),
+                              reinterpret_cast<const Byte*>(&wlen) + 4);
+        packed_partial.insert(packed_partial.end(),
+                              reinterpret_cast<const Byte*>(word.data()),
+                              reinterpret_cast<const Byte*>(word.data()) + word.size());
+        uint64_t cnt = static_cast<uint64_t>(count);
+        packed_partial.insert(packed_partial.end(),
+                              reinterpret_cast<const Byte*>(&cnt),
+                              reinterpret_cast<const Byte*>(&cnt) + 8);
+    }
+
+    int part_size = static_cast<int>(packed_partial.size());
+    std::vector<int> part_counts(nranks), part_displs(nranks);
+    MPI_Allgather(&part_size, 1, MPI_INT,
+                  part_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    part_displs[0] = 0;
+    for (int r = 1; r < nranks; ++r)
+        part_displs[r] = part_displs[r - 1] + part_counts[r - 1];
+    const int total_part = part_displs[nranks - 1] + part_counts[nranks - 1];
+
+    std::vector<Byte> all_sorted(total_part);
+    MPI_Allgatherv(packed_partial.data(), part_size, MPI_BYTE,
+                   all_sorted.data(), part_counts.data(), part_displs.data(),
+                   MPI_BYTE, MPI_COMM_WORLD);
+
+    // Unpack in rank order → globally sorted list.
+    std::vector<std::pair<std::string, std::size_t>> sorted_global;
+    sorted_global.reserve(partial_map.size() * nranks);
+    for (int r = 0; r < nranks; ++r) {
+        const Byte* p  = all_sorted.data() + part_displs[r];
+        const Byte* ep = p + part_counts[r];
+        while (p < ep) {
+            uint32_t wlen;
+            std::memcpy(&wlen, p, 4); p += 4;
+            std::string word(reinterpret_cast<const char*>(p), wlen); p += wlen;
+            uint64_t cnt;
+            std::memcpy(&cnt, p, 8); p += 8;
+            sorted_global.push_back({std::move(word), static_cast<std::size_t>(cnt)});
+        }
+    }
+
+    step_ms[6] = elapsed_ms(tp, std::chrono::steady_clock::now());
+
+    // -------------------------------------------------------------------------
+    // Step 7: build results
     // -------------------------------------------------------------------------
     tp = std::chrono::steady_clock::now();
 
@@ -266,6 +331,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
 #else
     // no-MPI: single-rank path, local_wcs is already the global result
     step_ms[3] = 0;
+    step_ms[6] = 0;  // no second allgatherv
 
     tp = std::chrono::steady_clock::now();
 
@@ -291,7 +357,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     }
 #endif
 
-    step_ms[6] = elapsed_ms(tp, std::chrono::steady_clock::now());
+    step_ms[7] = elapsed_ms(tp, std::chrono::steady_clock::now());
 
     write_timing(rank, nranks, step_ms);
 }
