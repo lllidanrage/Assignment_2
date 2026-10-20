@@ -390,10 +390,19 @@ void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
 
     std::vector<std::int64_t> step_ms(3, 0);
 
+    // Shard splits across ranks; each rank builds state on its own slice.
+    const std::size_t total  = splits.size();
+    const std::size_t stride = (total + static_cast<std::size_t>(nranks) - 1)
+                               / static_cast<std::size_t>(nranks);
+    const std::size_t start  = static_cast<std::size_t>(rank) * stride;
+    const std::size_t end    = std::min(start + stride, total);
+    const std::vector<CharSplit> local_splits(splits.begin() + start,
+                                              splits.begin() + end);
+
     t2_state state;
 
     auto tp = std::chrono::steady_clock::now();
-    build_state(splits, state);
+    build_state(local_splits, state);
     step_ms[0] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 build_state: " << step_ms[0] << " ms";
 
