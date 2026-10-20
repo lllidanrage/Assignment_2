@@ -27,6 +27,7 @@ inline bool is_ws(Byte b) {
     return b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D;
 }
 
+#ifdef BPE_HAVE_MPI
 // Serialize word_counts into a flat byte buffer.
 // Per entry: [uint32 word_len][word bytes][uint64 count]
 std::vector<Byte> pack_word_counts(const std::vector<WordCount>& wcs) {
@@ -43,6 +44,7 @@ std::vector<Byte> pack_word_counts(const std::vector<WordCount>& wcs) {
     }
     return buf;
 }
+#endif
 
 // Write per-rank step timings to timing-<job>.txt.
 // local_times layout (one row per rank, NSTEPS columns):
@@ -218,10 +220,11 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     // -------------------------------------------------------------------------
     tp = std::chrono::steady_clock::now();
 
-    // Partition the 256 first-byte values evenly across ranks.
-    const int bytes_per_rank = (256 + nranks - 1) / nranks;
+    // Split 0-127 evenly across ranks; last rank extends to 255 to catch
+    // all non-ASCII bytes without giving them a dedicated rank.
+    const int bytes_per_rank = (128 + nranks - 1) / nranks;
     const int range_start    = rank * bytes_per_rank;
-    const int range_end      = std::min(range_start + bytes_per_rank, 256);
+    const int range_end      = (rank == nranks - 1) ? 256 : range_start + bytes_per_rank;
 
     // Merge only entries whose first byte falls in [range_start, range_end).
     std::unordered_map<std::string, std::size_t> partial_map;
