@@ -57,10 +57,15 @@ void write_timing(int rank, int nranks,
         "merge        ", "sort         ", "allgatherv2  ", "build_results"};
 
 #ifdef BPE_HAVE_MPI
-    std::vector<std::int64_t> all_times(nranks * NSTEPS);
-    MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
-               all_times.data(), NSTEPS, MPI_INT64_T,
-               0, MPI_COMM_WORLD);
+    std::vector<std::int64_t> all_times;
+    if (nranks > 1) {
+        all_times.resize(nranks * NSTEPS);
+        MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
+                   all_times.data(), NSTEPS, MPI_INT64_T,
+                   0, MPI_COMM_WORLD);
+    } else {
+        all_times = local_times;
+    }
 #else
     (void)rank;
     (void)nranks;
@@ -104,36 +109,41 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     // -------------------------------------------------------------------------
     auto tp = std::chrono::steady_clock::now();
 
+    std::vector<Byte> local_buf;
 #ifdef BPE_HAVE_MPI
-    std::vector<int> snd_counts(nranks, 0);
-    std::vector<int> snd_displs(nranks, 0);
+    if (nranks > 1) {
+        std::vector<int> snd_counts(nranks, 0);
+        std::vector<int> snd_displs(nranks, 0);
 
-    if (rank == 0) {
-        const std::size_t total = input.size();
-        std::size_t pos = 0;
-        for (int r = 0; r < nranks; ++r) {
-            snd_displs[r] = static_cast<int>(pos);
-            std::size_t ideal =
-                total * static_cast<std::size_t>(r + 1) / nranks;
-            std::size_t end = (r < nranks - 1) ? ideal : total;
-            while (end < total && !is_ws(input[end])) ++end;
-            snd_counts[r] = static_cast<int>(end - pos);
-            pos = end;
+        if (rank == 0) {
+            const std::size_t total = input.size();
+            std::size_t pos = 0;
+            for (int r = 0; r < nranks; ++r) {
+                snd_displs[r] = static_cast<int>(pos);
+                std::size_t ideal =
+                    total * static_cast<std::size_t>(r + 1) / nranks;
+                std::size_t end = (r < nranks - 1) ? ideal : total;
+                while (end < total && !is_ws(input[end])) ++end;
+                snd_counts[r] = static_cast<int>(end - pos);
+                pos = end;
+            }
+            snd_counts[nranks - 1] =
+                static_cast<int>(total - snd_displs[nranks - 1]);
         }
-        snd_counts[nranks - 1] =
-            static_cast<int>(total - snd_displs[nranks - 1]);
+
+        MPI_Bcast(snd_counts.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(snd_displs.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
+
+        local_buf.resize(snd_counts[rank]);
+        MPI_Scatterv(rank == 0 ? input.data() : nullptr,
+                     snd_counts.data(), snd_displs.data(), MPI_BYTE,
+                     local_buf.data(), snd_counts[rank], MPI_BYTE,
+                     0, MPI_COMM_WORLD);
+    } else {
+        local_buf = std::move(input);
     }
-
-    MPI_Bcast(snd_counts.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(snd_displs.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
-
-    std::vector<Byte> local_buf(snd_counts[rank]);
-    MPI_Scatterv(rank == 0 ? input.data() : nullptr,
-                 snd_counts.data(), snd_displs.data(), MPI_BYTE,
-                 local_buf.data(), snd_counts[rank], MPI_BYTE,
-                 0, MPI_COMM_WORLD);
 #else
-    std::vector<Byte> local_buf = std::move(input);
+    local_buf = std::move(input);
 #endif
 
     step_ms[0] = elapsed_ms(tp, std::chrono::steady_clock::now());
@@ -193,6 +203,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     tp = std::chrono::steady_clock::now();
 
 #ifdef BPE_HAVE_MPI
+    if (nranks > 1) {
     std::vector<Byte> packed = pack_word_counts(local_wcs);
     int local_size = static_cast<int>(packed.size());
 
@@ -331,6 +342,32 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
         }
     }
 
+    } else {
+        // nranks == 1 but compiled with MPI: skip all MPI collectives
+        step_ms[3] = 0;
+        step_ms[6] = 0;
+
+        tp = std::chrono::steady_clock::now();
+
+        std::vector<std::pair<std::string, std::size_t>> sg;
+        sg.reserve(local_wcs.size());
+        for (const WordCount& wc : local_wcs)
+            sg.push_back({std::string(wc.word.begin(), wc.word.end()), wc.count});
+
+        step_ms[4] = elapsed_ms(tp, std::chrono::steady_clock::now());
+
+        tp = std::chrono::steady_clock::now();
+
+        results.word_counts.clear();
+        results.char_splits.clear();
+        results.word_counts.reserve(sg.size());
+        results.char_splits.reserve(sg.size());
+        for (const auto& [word, count] : sg) {
+            std::vector<Byte> bytes(word.begin(), word.end());
+            results.word_counts.push_back(WordCount{bytes, count});
+            results.char_splits.push_back(CharSplit{std::move(bytes), count});
+        }
+    }
 #else
     // no-MPI: single-rank path, local_wcs is already the global result
     step_ms[3] = 0;
