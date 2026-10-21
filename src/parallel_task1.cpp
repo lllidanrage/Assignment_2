@@ -2,11 +2,13 @@
 #include "absl/log/log.h"
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <omp.h>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,12 +30,83 @@ inline bool is_ws(Byte b) {
 }
 
 #ifdef BPE_HAVE_MPI
+template <typename Prepare>
+void prepare_mpi_buffers(Prepare prepare) {
+    int failed = 0;
+    try {
+        prepare();
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "task1 rank " << mpi_rank() << ": " << error.what();
+        failed = 1;
+    }
+    int any_failed = 0;
+    MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (any_failed)
+        throw std::runtime_error("task1: MPI buffer allocation or size limit failed");
+}
+
+void scatter_bytes(const Byte* input, Byte* output,
+                   const std::vector<std::uint64_t>& offsets, int rank,
+                   int nranks, std::uint64_t chunk_limit = INT_MAX) {
+    if (rank == 0) {
+        if (offsets[1] != 0)
+            std::memcpy(output, input, static_cast<std::size_t>(offsets[1]));
+        for (int r = 1; r < nranks; ++r) {
+            for (auto offset = offsets[r]; offset < offsets[r + 1];) {
+                const int count = static_cast<int>(
+                    std::min(chunk_limit, offsets[r + 1] - offset));
+                MPI_Send(input + offset, count, MPI_BYTE, r, 0, MPI_COMM_WORLD);
+                offset += count;
+            }
+        }
+    } else {
+        const auto size = offsets[rank + 1] - offsets[rank];
+        for (std::uint64_t offset = 0; offset < size;) {
+            const int count = static_cast<int>(std::min(chunk_limit, size - offset));
+            MPI_Recv(output + offset, count, MPI_BYTE, 0, 0, MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
+            offset += count;
+        }
+    }
+}
+
+void allgather_bytes(const std::vector<Byte>& local, std::vector<Byte>& gathered,
+                     std::vector<std::uint64_t>& offsets, int nranks) {
+    std::vector<std::uint64_t> sizes;
+    std::vector<int> counts, displs;
+    prepare_mpi_buffers([&] {
+        sizes.resize(nranks);
+        offsets.assign(static_cast<std::size_t>(nranks) + 1, 0);
+        counts.resize(nranks);
+        displs.resize(nranks);
+    });
+    const std::uint64_t local_size = local.size();
+    MPI_Allgather(&local_size, 1, MPI_UINT64_T, sizes.data(), 1,
+                  MPI_UINT64_T, MPI_COMM_WORLD);
+    for (int r = 0; r < nranks; ++r) {
+        if (sizes[r] > static_cast<std::uint64_t>(INT_MAX) - offsets[r])
+            throw std::length_error(
+                "task1: serialized word counts exceed MPI_Allgatherv INT_MAX bytes");
+        offsets[r + 1] = offsets[r] + sizes[r];
+        counts[r] = static_cast<int>(sizes[r]);
+        displs[r] = static_cast<int>(offsets[r]);
+    }
+    prepare_mpi_buffers([&] {
+        gathered.resize(static_cast<std::size_t>(offsets.back()));
+    });
+    MPI_Allgatherv(local.data(), static_cast<int>(local_size), MPI_BYTE,
+                   gathered.data(), counts.data(), displs.data(), MPI_BYTE,
+                   MPI_COMM_WORLD);
+}
+
 // Serialize word_counts into a flat byte buffer.
 // Per entry: [uint32 word_len][word bytes][uint64 count]
 std::vector<Byte> pack_word_counts(const std::vector<WordCount>& wcs) {
     std::vector<Byte> buf;
     buf.reserve(wcs.size() * 16);
     for (const WordCount& wc : wcs) {
+        if (wc.word.size() > UINT32_MAX)
+            throw std::length_error("task1 word exceeds serialized length limit");
         uint32_t len = static_cast<uint32_t>(wc.word.size());
         buf.insert(buf.end(), reinterpret_cast<const Byte*>(&len),
                    reinterpret_cast<const Byte*>(&len) + 4);
@@ -112,33 +185,33 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     std::vector<Byte> local_buf;
 #ifdef BPE_HAVE_MPI
     if (nranks > 1) {
-        std::vector<int> snd_counts(nranks, 0);
-        std::vector<int> snd_displs(nranks, 0);
+        std::vector<std::uint64_t> offsets;
+        prepare_mpi_buffers([&] { offsets.resize(static_cast<std::size_t>(nranks) + 1); });
 
         if (rank == 0) {
             const std::size_t total = input.size();
             std::size_t pos = 0;
             for (int r = 0; r < nranks; ++r) {
-                snd_displs[r] = static_cast<int>(pos);
+                offsets[r] = pos;
                 std::size_t ideal =
-                    total * static_cast<std::size_t>(r + 1) / nranks;
-                std::size_t end = (r < nranks - 1) ? ideal : total;
+                    total / nranks * (r + 1) +
+                    (total % nranks) * static_cast<std::uint64_t>(r + 1) / nranks;
+                std::size_t end = std::max(pos, ideal);
                 while (end < total && !is_ws(input[end])) ++end;
-                snd_counts[r] = static_cast<int>(end - pos);
                 pos = end;
             }
-            snd_counts[nranks - 1] =
-                static_cast<int>(total - snd_displs[nranks - 1]);
+            offsets[nranks] = total;
         }
 
-        MPI_Bcast(snd_counts.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(snd_displs.data(), nranks, MPI_INT, 0, MPI_COMM_WORLD);
-
-        local_buf.resize(snd_counts[rank]);
-        MPI_Scatterv(rank == 0 ? input.data() : nullptr,
-                     snd_counts.data(), snd_displs.data(), MPI_BYTE,
-                     local_buf.data(), snd_counts[rank], MPI_BYTE,
-                     0, MPI_COMM_WORLD);
+        MPI_Bcast(offsets.data(), nranks, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&offsets[nranks], 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        prepare_mpi_buffers([&] {
+            const auto size = offsets[rank + 1] - offsets[rank];
+            if (size > local_buf.max_size())
+                throw std::length_error("task1 corpus shard too large");
+            local_buf.resize(static_cast<std::size_t>(size));
+        });
+        scatter_bytes(input.data(), local_buf.data(), offsets, rank, nranks);
     } else {
         local_buf = std::move(input);
     }
@@ -204,23 +277,11 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
 
 #ifdef BPE_HAVE_MPI
     if (nranks > 1) {
-    std::vector<Byte> packed = pack_word_counts(local_wcs);
-    int local_size = static_cast<int>(packed.size());
-
-    std::vector<int> rcv_counts(nranks);
-    MPI_Allgather(&local_size, 1, MPI_INT,
-                  rcv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-    std::vector<int> rcv_displs(nranks);
-    rcv_displs[0] = 0;
-    for (int r = 1; r < nranks; ++r)
-        rcv_displs[r] = rcv_displs[r - 1] + rcv_counts[r - 1];
-    const int total_rcv = rcv_displs[nranks - 1] + rcv_counts[nranks - 1];
-
-    std::vector<Byte> all_packed(total_rcv);
-    MPI_Allgatherv(packed.data(), local_size, MPI_BYTE,
-                   all_packed.data(), rcv_counts.data(), rcv_displs.data(),
-                   MPI_BYTE, MPI_COMM_WORLD);
+    std::vector<Byte> packed;
+    prepare_mpi_buffers([&] { packed = pack_word_counts(local_wcs); });
+    std::vector<std::uint64_t> rcv_offsets;
+    std::vector<Byte> all_packed;
+    allgather_bytes(packed, all_packed, rcv_offsets, nranks);
 
     step_ms[3] = elapsed_ms(tp, std::chrono::steady_clock::now());
 
@@ -240,8 +301,9 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     // Merge only entries whose first byte falls in [range_start, range_end).
     std::unordered_map<std::string, std::size_t> partial_map;
     for (int r = 0; r < nranks; ++r) {
-        const Byte* p  = all_packed.data() + rcv_displs[r];
-        const Byte* ep = p + rcv_counts[r];
+        if (rcv_offsets[r] == rcv_offsets[r + 1]) continue;
+        const Byte* p  = all_packed.data() + rcv_offsets[r];
+        const Byte* ep = all_packed.data() + rcv_offsets[r + 1];
         while (p < ep) {
             uint32_t len;
             std::memcpy(&len, p, 4);
@@ -275,41 +337,36 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     // -------------------------------------------------------------------------
     // Pack this rank's sorted slice.
     std::vector<Byte> packed_partial;
-    packed_partial.reserve(sorted_partial.size() * 16);
-    for (const auto& [word, count] : sorted_partial) {
-        uint32_t wlen = static_cast<uint32_t>(word.size());
-        packed_partial.insert(packed_partial.end(),
-                              reinterpret_cast<const Byte*>(&wlen),
-                              reinterpret_cast<const Byte*>(&wlen) + 4);
-        packed_partial.insert(packed_partial.end(),
-                              reinterpret_cast<const Byte*>(word.data()),
-                              reinterpret_cast<const Byte*>(word.data()) + word.size());
-        uint64_t cnt = static_cast<uint64_t>(count);
-        packed_partial.insert(packed_partial.end(),
-                              reinterpret_cast<const Byte*>(&cnt),
-                              reinterpret_cast<const Byte*>(&cnt) + 8);
-    }
+    prepare_mpi_buffers([&] {
+        packed_partial.reserve(sorted_partial.size() * 16);
+        for (const auto& [word, count] : sorted_partial) {
+            if (word.size() > UINT32_MAX)
+                throw std::length_error("task1 word exceeds serialized length limit");
+            uint32_t wlen = static_cast<uint32_t>(word.size());
+            packed_partial.insert(packed_partial.end(),
+                                  reinterpret_cast<const Byte*>(&wlen),
+                                  reinterpret_cast<const Byte*>(&wlen) + 4);
+            packed_partial.insert(packed_partial.end(),
+                                  reinterpret_cast<const Byte*>(word.data()),
+                                  reinterpret_cast<const Byte*>(word.data()) + word.size());
+            uint64_t cnt = static_cast<uint64_t>(count);
+            packed_partial.insert(packed_partial.end(),
+                                  reinterpret_cast<const Byte*>(&cnt),
+                                  reinterpret_cast<const Byte*>(&cnt) + 8);
+        }
+    });
 
-    int part_size = static_cast<int>(packed_partial.size());
-    std::vector<int> part_counts(nranks), part_displs(nranks);
-    MPI_Allgather(&part_size, 1, MPI_INT,
-                  part_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-    part_displs[0] = 0;
-    for (int r = 1; r < nranks; ++r)
-        part_displs[r] = part_displs[r - 1] + part_counts[r - 1];
-    const int total_part = part_displs[nranks - 1] + part_counts[nranks - 1];
-
-    std::vector<Byte> all_sorted(total_part);
-    MPI_Allgatherv(packed_partial.data(), part_size, MPI_BYTE,
-                   all_sorted.data(), part_counts.data(), part_displs.data(),
-                   MPI_BYTE, MPI_COMM_WORLD);
+    std::vector<std::uint64_t> part_offsets;
+    std::vector<Byte> all_sorted;
+    allgather_bytes(packed_partial, all_sorted, part_offsets, nranks);
 
     // Unpack in rank order → globally sorted list.
     std::vector<std::pair<std::string, std::size_t>> sorted_global;
     sorted_global.reserve(partial_map.size() * nranks);
     for (int r = 0; r < nranks; ++r) {
-        const Byte* p  = all_sorted.data() + part_displs[r];
-        const Byte* ep = p + part_counts[r];
+        if (part_offsets[r] == part_offsets[r + 1]) continue;
+        const Byte* p  = all_sorted.data() + part_offsets[r];
+        const Byte* ep = all_sorted.data() + part_offsets[r + 1];
         while (p < ep) {
             uint32_t wlen;
             std::memcpy(&wlen, p, 4); p += 4;
