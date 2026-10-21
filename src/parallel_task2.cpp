@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef BPE_HAVE_MPI
@@ -18,14 +19,12 @@
 namespace bpe {
 namespace {
 
-// ---- types (mirror task2.cpp) -----------------------------------------------
-
 using u8  = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-constexpr u32 no_pos   = std::numeric_limits<u32>::max();
-constexpr u32 kVocab   = 256;
+constexpr u32 no_pos  = std::numeric_limits<u32>::max();
+constexpr u32 kVocab  = 256;
 constexpr std::size_t kBudget = 256;
 
 u64 pack_pair(u32 l, u32 r) { return (static_cast<u64>(l) << 32) | r; }
@@ -51,41 +50,6 @@ struct pair_state {
     u64 fingerprint = 0;
 };
 
-struct queue_entry { u64 count = 0, fingerprint = 0; u32 state = 0; };
-
-struct t2_state;
-struct queue_cmp {
-    const t2_state* s = nullptr;
-    bool operator()(const queue_entry& a, const queue_entry& b) const;
-};
-
-struct queue_heap {
-    std::vector<queue_entry> data;
-    queue_cmp comp;
-    bool empty() const { return data.empty(); }
-    const queue_entry& top() const { return data.front(); }
-    void push(queue_entry e) { data.push_back(e); sift_up(data.size()-1); }
-    void pop() {
-        data[0] = std::move(data.back()); data.pop_back();
-        if (!data.empty()) sift_down(0);
-    }
-   private:
-    static std::size_t par(std::size_t i) { return (i-1)/4; }
-    static std::size_t fc (std::size_t i) { return 4*i+1; }
-    void sift_up(std::size_t i) {
-        while (i > 0) { auto p = par(i); if (!comp(data[p],data[i])) break; std::swap(data[p],data[i]); i=p; }
-    }
-    void sift_down(std::size_t i) {
-        for (;;) {
-            auto f = fc(i); if (f >= data.size()) break;
-            auto best = f, end = std::min(f+4, data.size());
-            for (auto c = f+1; c < end; ++c) if (comp(data[best],data[c])) best=c;
-            if (!comp(data[i],data[best])) break;
-            std::swap(data[i],data[best]); i=best;
-        }
-    }
-};
-
 struct t2_state {
     std::vector<u64> word_freq;
     std::vector<u32> token, prev, next, word_of, edge_group;
@@ -99,18 +63,6 @@ struct t2_state {
     std::vector<u32> born_states;
     u32 free_head = no_pos;
 };
-
-bool queue_cmp::operator()(const queue_entry& a, const queue_entry& b) const {
-    if (a.count != b.count) return a.count < b.count;
-    if (a.fingerprint != b.fingerprint) return a.fingerprint > b.fingerprint;
-    const pair_state& pa = s->pair_states[a.state];
-    const pair_state& pb = s->pair_states[b.state];
-    const std::string ta = s->vocab[pair_left(pa.key)]  + s->vocab[pair_right(pa.key)];
-    const std::string tb = s->vocab[pair_left(pb.key)]  + s->vocab[pair_right(pb.key)];
-    const int cmp = std::strcmp(ta.c_str(), tb.c_str());
-    if (cmp != 0) return cmp > 0;
-    return pa.key > pb.key;
-}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -182,26 +134,7 @@ bool pair_is_at(const t2_state& s, u32 p, u32 left, u32 right) {
     return is_live(s,np) && s.token[np]==right;
 }
 
-void push_born(t2_state& s, queue_heap& q) {
-    for (u32 id : s.born_states) {
-        const auto& ps = s.pair_states[id];
-        if (ps.word_count>=2 && ps.count!=0) q.push({ps.count,ps.fingerprint,id});
-    }
-    s.born_states.clear();
-}
-
-u32 pop_best(t2_state& s, queue_heap& q) {
-    while (!q.empty()) {
-        auto e = q.top(); q.pop();
-        const auto& ps = s.pair_states[e.state];
-        if (ps.word_count<2 || ps.count==0) continue;
-        if (e.count!=ps.count) { q.push({ps.count,ps.fingerprint,e.state}); continue; }
-        return e.state;
-    }
-    return no_pos;
-}
-
-// ---- three phases -----------------------------------------------------------
+// ---- build_state ------------------------------------------------------------
 
 void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
     if (splits.size() >= no_pos) throw std::length_error("too many distinct words");
@@ -220,7 +153,7 @@ void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
     s.group_state.reserve(slots); s.group_count.reserve(slots);
 
     std::vector<u32> init(kVocab*kVocab, no_pos);
-    for (u32 w = 0; w < splits.size(); ++w) {
+    for (u32 w = 0; w < static_cast<u32>(splits.size()); ++w) {
         const auto& sp = splits[w];
         s.word_freq.push_back(sp.count);
         u32 first = static_cast<u32>(s.token.size());
@@ -263,65 +196,159 @@ void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
     s.right_stamp.assign(cache,no_pos); s.right_state.assign(cache,no_pos);
 }
 
-void run_merge_loop(t2_state& s) {
-    queue_heap q; q.comp.s = &s;
-    for (u32 id = 0; id < s.pair_states.size(); ++id) {
-        const auto& ps = s.pair_states[id];
-        if (ps.word_count>=2) q.push({ps.count,ps.fingerprint,id});
-    }
-    std::vector<u32> sel_stamp(s.pair_states.size(), 0);
-    u32 round_stamp = 0;
-    std::vector<u32> batch;
+struct GP { u64 key, cnt, fp; };  // candidate pair for selection
+
+void run_merge_loop_parallel(t2_state& state, int nranks) {
+    // Build key → local pair_state id map.
+    std::unordered_map<u64, u32> key_to_id;
+    key_to_id.reserve(state.pair_states.size() * 2);
+    for (u32 id = 0; id < static_cast<u32>(state.pair_states.size()); ++id)
+        key_to_id[state.pair_states[id].key] = id;
 
     for (;;) {
-        ++round_stamp; batch.clear();
-        while (batch.size() < kBudget) {
-            u32 best = pop_best(s, q);
-            if (best==no_pos) break;
-            if (best >= sel_stamp.size()) sel_stamp.resize(s.pair_states.size(), 0);
-            if (sel_stamp[best]==round_stamp) continue;
-            sel_stamp[best]=round_stamp; batch.push_back(best);
+        // 1. Pack local active pairs as triples: (key, count, word_count).
+        std::vector<u64> local_buf;
+        for (const auto& ps : state.pair_states) {
+            if (ps.count > 0 && ps.word_count > 0) {
+                local_buf.push_back(ps.key);
+                local_buf.push_back(ps.count);
+                local_buf.push_back(static_cast<u64>(ps.word_count));
+            }
         }
-        if (batch.empty()) break;
+        int local_n = static_cast<int>(local_buf.size());
 
-        for (u32 sel : batch) {
-            u64 key = s.pair_states[sel].key;
-            std::vector<u32> positions = std::move(s.pair_states[sel].positions);
-            u32 lt=pair_left(key), rt=pair_right(key);
-            u32 mt=static_cast<u32>(s.vocab.size());
-            std::string merged; merged.reserve(s.vocab[lt].size()+s.vocab[rt].size());
-            merged.append(s.vocab[lt]); merged.append(s.vocab[rt]);
-            s.vocab.push_back(std::move(merged)); s.token_count.push_back(0);
-            if (s.left_stamp.size()<=mt) {
-                std::size_t ns=std::max<std::size_t>(s.left_stamp.size()*2, mt+1024);
-                s.left_stamp.resize(ns,no_pos); s.left_state.resize(ns,no_pos);
-                s.right_stamp.resize(ns,no_pos); s.right_state.resize(ns,no_pos);
+        // 2. Allgatherv all pairs.
+        std::vector<u64> all_buf;
+#ifdef BPE_HAVE_MPI
+        if (nranks > 1) {
+            std::vector<int> rc(nranks), rd(nranks);
+            MPI_Allgather(&local_n, 1, MPI_INT,
+                          rc.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            rd[0] = 0;
+            for (int r = 1; r < nranks; ++r) rd[r] = rd[r-1] + rc[r-1];
+            int tot = rd[nranks-1] + rc[nranks-1];
+            all_buf.resize(tot);
+            MPI_Allgatherv(local_buf.data(), local_n, MPI_UINT64_T,
+                           all_buf.data(), rc.data(), rd.data(),
+                           MPI_UINT64_T, MPI_COMM_WORLD);
+        } else {
+            all_buf = std::move(local_buf);
+        }
+#else
+        all_buf = std::move(local_buf);
+#endif
+
+        // 3. Build global key → (count, word_count).
+        std::unordered_map<u64, std::pair<u64,u64>> gmap;
+        for (std::size_t i = 0; i < all_buf.size(); i += 3) {
+            auto& g = gmap[all_buf[i]];
+            g.first  += all_buf[i+1];
+            g.second += all_buf[i+2];
+        }
+
+        // 4. Build candidate list (global word_count >= 2).
+        std::vector<GP> cands;
+        cands.reserve(gmap.size());
+        for (const auto& [key, cw] : gmap) {
+            if (cw.second < 2) continue;
+            cands.push_back({key, cw.first,
+                text_fingerprint(state.vocab[pair_left(key)],
+                                 state.vocab[pair_right(key)])});
+        }
+        if (cands.empty()) break;
+
+        // 5. Select top kBudget — same ordering as queue_compare (deterministic).
+        auto cmp_gp = [&state](const GP& a, const GP& b) {
+            if (a.cnt != b.cnt) return a.cnt > b.cnt;
+            if (a.fp  != b.fp)  return a.fp  < b.fp;
+            const std::string ta = state.vocab[pair_left(a.key)]
+                                 + state.vocab[pair_right(a.key)];
+            const std::string tb = state.vocab[pair_left(b.key)]
+                                 + state.vocab[pair_right(b.key)];
+            const int c = std::strcmp(ta.c_str(), tb.c_str());
+            if (c != 0) return c < 0;
+            return a.key < b.key;
+        };
+        const std::size_t take = std::min(cands.size(), kBudget);
+        if (cands.size() > take) {
+            std::partial_sort(cands.begin(),
+                              cands.begin() + static_cast<std::ptrdiff_t>(take),
+                              cands.end(), cmp_gp);
+            cands.resize(take);
+        } else {
+            std::sort(cands.begin(), cands.end(), cmp_gp);
+        }
+
+        // 6. Apply merges.
+        for (const auto& gp : cands) {
+            const u32 lt = pair_left(gp.key), rt = pair_right(gp.key);
+            const u32 mt = static_cast<u32>(state.vocab.size());
+
+            // All ranks: extend vocab + token_count to keep token IDs in sync.
+            {
+                std::string mg;
+                mg.reserve(state.vocab[lt].size() + state.vocab[rt].size());
+                mg.append(state.vocab[lt]); mg.append(state.vocab[rt]);
+                state.vocab.push_back(std::move(mg));
+                state.token_count.push_back(0);
             }
-            u32 cw=no_pos; u64 freq=0;
-            for (u32 pos : positions) {
-                if (!pair_is_at(s,pos,lt,rt)) continue;
-                u32 rp=s.next[pos], w=s.word_of[pos];
-                if (w!=cw) { cw=w; freq=s.word_freq[w]; }
-                u32 lp=s.prev[pos], ap=s.next[rp];
-                if (is_live(s,lp)) remove_edge(s,lp,freq);
-                remove_edge(s,pos,freq);
-                if (is_live(s,ap)) remove_edge(s,rp,freq);
-                s.token_count[lt]-=freq; s.token_count[rt]-=freq; s.token_count[mt]+=freq;
-                s.token[pos]=mt; s.alive[rp]=0; s.next[pos]=ap;
-                if (ap!=no_pos) s.prev[ap]=pos;
-                s.prev[rp]=no_pos; s.next[rp]=no_pos; s.edge_group[rp]=no_pos;
-                if (is_live(s,lp)) add_edge(s,lp,get_left_ps(s,s.token[lp],mt),w,freq);
-                if (is_live(s,ap)) add_edge(s,pos,get_right_ps(s,mt,s.token[ap]),w,freq);
+            if (state.left_stamp.size() <= static_cast<std::size_t>(mt)) {
+                std::size_t ns = std::max<std::size_t>(
+                    state.left_stamp.size() * 2, mt + 1024);
+                state.left_stamp.resize(ns, no_pos);
+                state.left_state.resize(ns, no_pos);
+                state.right_stamp.resize(ns, no_pos);
+                state.right_state.resize(ns, no_pos);
+            }
+
+            // Local merge: only if this rank has occurrences of this pair.
+            auto it = key_to_id.find(gp.key);
+            if (it != key_to_id.end()) {
+                u32 sid = it->second;
+                std::vector<u32> positions =
+                    std::move(state.pair_states[sid].positions);
+                u32 cw = no_pos; u64 freq = 0;
+                for (u32 pos : positions) {
+                    if (!pair_is_at(state, pos, lt, rt)) continue;
+                    u32 rp = state.next[pos], w = state.word_of[pos];
+                    if (w != cw) { cw = w; freq = state.word_freq[w]; }
+                    u32 lp = state.prev[pos], ap = state.next[rp];
+                    if (is_live(state, lp)) remove_edge(state, lp, freq);
+                    remove_edge(state, pos, freq);
+                    if (is_live(state, ap)) remove_edge(state, rp, freq);
+                    state.token_count[lt] -= freq;
+                    state.token_count[rt] -= freq;
+                    state.token_count[mt] += freq;
+                    state.token[pos] = mt;
+                    state.alive[rp] = 0;
+                    state.next[pos] = ap;
+                    if (ap != no_pos) state.prev[ap] = pos;
+                    state.prev[rp] = no_pos;
+                    state.next[rp] = no_pos;
+                    state.edge_group[rp] = no_pos;
+                    if (is_live(state, lp))
+                        add_edge(state, lp,
+                                 get_left_ps(state, state.token[lp], mt), w, freq);
+                    if (is_live(state, ap))
+                        add_edge(state, pos,
+                                 get_right_ps(state, mt, state.token[ap]), w, freq);
+                }
             }
         }
-        push_born(s, q);
+
+        // Register newly born pair_states (created during merges above).
+        for (u32 id : state.born_states)
+            key_to_id[state.pair_states[id].key] = id;
+        state.born_states.clear();
     }
 }
+
+// ---- finalize ---------------------------------------------------------------
 
 void finalize_results(const t2_state& s, Results& results) {
     std::vector<u32> live;
     live.reserve(s.token_count.size());
-    for (u32 id = 1; id < s.token_count.size(); ++id)
+    for (u32 id = 1; id < static_cast<u32>(s.token_count.size()); ++id)
         if (s.token_count[id]!=0) live.push_back(id);
     std::sort(live.begin(), live.end(), [&s](u32 a, u32 b){
         if (s.token_count[a]!=s.token_count[b]) return s.token_count[a]>s.token_count[b];
@@ -333,6 +360,23 @@ void finalize_results(const t2_state& s, Results& results) {
         results.tokens.push_back({std::vector<Byte>(txt.begin(),txt.end()),
                                    static_cast<std::size_t>(s.token_count[id])});
     }
+}
+
+void finalize_results_parallel(t2_state& state, Results& results,
+                                int rank, int nranks) {
+#ifdef BPE_HAVE_MPI
+    if (nranks > 1) {
+        // Sum token_count across all ranks to rank 0.
+        std::vector<u64> gtc(state.token_count.size(), 0);
+        MPI_Reduce(state.token_count.data(), gtc.data(),
+                   static_cast<int>(state.token_count.size()),
+                   MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0) state.token_count = std::move(gtc);
+    }
+#else
+    (void)nranks;
+#endif
+    if (rank == 0) finalize_results(state, results);
 }
 
 // ---- timing -----------------------------------------------------------------
@@ -349,10 +393,15 @@ void write_timing_task2(int rank, int nranks,
         "build_state  ", "merge_loop   ", "finalize     "};
 
 #ifdef BPE_HAVE_MPI
-    std::vector<std::int64_t> all_times(nranks * NSTEPS);
-    MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
-               all_times.data(), NSTEPS, MPI_INT64_T,
-               0, MPI_COMM_WORLD);
+    std::vector<std::int64_t> all_times;
+    if (nranks > 1) {
+        all_times.resize(nranks * NSTEPS);
+        MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
+                   all_times.data(), NSTEPS, MPI_INT64_T,
+                   0, MPI_COMM_WORLD);
+    } else {
+        all_times = local_times;
+    }
 #else
     (void)rank; (void)nranks;
     const std::vector<std::int64_t>& all_times = local_times;
@@ -407,12 +456,12 @@ void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
     LOG(INFO) << "task2 build_state: " << step_ms[0] << " ms";
 
     tp = std::chrono::steady_clock::now();
-    run_merge_loop(state);
+    run_merge_loop_parallel(state, nranks);
     step_ms[1] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 merge_loop: " << step_ms[1] << " ms";
 
     tp = std::chrono::steady_clock::now();
-    finalize_results(state, results);
+    finalize_results_parallel(state, results, rank, nranks);
     step_ms[2] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 finalize: " << step_ms[2] << " ms";
 
