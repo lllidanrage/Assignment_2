@@ -1,6 +1,6 @@
 /.DS_Store
 /input
-/result
+/result.csv
 
 # build
 /build*

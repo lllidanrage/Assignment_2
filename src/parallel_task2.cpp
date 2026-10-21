@@ -1,12 +1,19 @@
 #include "bpe.h"
+
+#include "absl/container/inlined_vector.h"
 #include "absl/log/log.h"
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
+#include <omp.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,6 +24,36 @@
 
 namespace bpe {
 namespace {
+
+inline int configure_parallel_threads(int rank, int nranks) {
+#ifdef BPE_HAVE_MPI
+    const char* tuple = std::getenv("BPE_THREADS");
+    if (tuple != nullptr && *tuple != '\0') {
+        const char* cursor = tuple;
+        int requested = 0;
+        for (int r = 0; r < nranks; ++r) {
+            char* end = nullptr;
+            errno = 0;
+            const long count = std::strtol(cursor, &end, 10);
+            if (end == cursor || errno == ERANGE || count < 1 ||
+                count > INT_MAX ||
+                (r + 1 < nranks ? *end != ',' : *end != '\0')) {
+                throw std::invalid_argument(
+                    "BPE_THREADS must contain one positive integer per MPI "
+                    "rank, separated by commas");
+            }
+            if (r == rank) requested = static_cast<int>(count);
+            cursor = r + 1 < nranks ? end + 1 : end;
+        }
+        omp_set_dynamic(0);
+        omp_set_num_threads(requested);
+    }
+#else
+    (void)rank;
+    (void)nranks;
+#endif
+    return omp_get_max_threads();
+}
 
 // ---- types (mirror task2.cpp) -----------------------------------------------
 
@@ -46,9 +83,12 @@ u64 text_fingerprint(const std::string& l, const std::string& r) {
 struct pair_state {
     u64 key = 0, count = 0;
     u32 word_count = 0;
-    std::vector<u32> positions;
+    absl::InlinedVector<u32, 2> positions;
     u32 last_word = no_pos, last_group = no_pos;
     u64 fingerprint = 0;
+    u64 sent_count = 0;
+    u32 sent_word_count = 0;
+    bool dirty = false;
 };
 
 struct queue_entry { u64 count = 0, fingerprint = 0; u32 state = 0; };
@@ -86,7 +126,52 @@ struct queue_heap {
     }
 };
 
-struct t2_state {
+class pair_index {
+    struct entry { u64 key = 0; u32 value = no_pos; u32 generation = 0; };
+    std::vector<entry> entries;
+    std::size_t used = 0;
+    u32 generation = 1;
+    static std::size_t hash(u64 key) {
+        key ^= key >> 30; key *= UINT64_C(0xbf58476d1ce4e5b9);
+        key ^= key >> 27; key *= UINT64_C(0x94d049bb133111eb);
+        return static_cast<std::size_t>(key ^ (key >> 31));
+    }
+    void place(u64 key, u32 value) {
+        std::size_t i = hash(key) & (entries.size() - 1);
+        while (entries[i].generation == generation) i = (i + 1) & (entries.size() - 1);
+        entries[i] = {key, value, generation};
+    }
+   public:
+    u32 find(u64 key) const {
+        if (entries.empty()) return no_pos;
+        std::size_t i = hash(key) & (entries.size() - 1);
+        while (entries[i].generation == generation) {
+            if (entries[i].key == key) return entries[i].value;
+            i = (i + 1) & (entries.size() - 1);
+        }
+        return no_pos;
+    }
+    void insert(u64 key, u32 value) {
+        if ((used + 1) * 10 >= entries.size() * 7) {
+            std::vector<entry> old;
+            old.swap(entries);
+            entries.resize(std::max<std::size_t>(1024, old.size() * 2));
+            for (const auto& item : old)
+                if (item.generation == generation) place(item.key, item.value);
+        }
+        place(key, value);
+        ++used;
+    }
+    void clear() {
+        used = 0;
+        if (++generation == 0) {
+            std::fill(entries.begin(), entries.end(), entry{});
+            generation = 1;
+        }
+    }
+};
+
+struct alignas(64) t2_state {
     std::vector<u64> word_freq;
     std::vector<u32> token, prev, next, word_of, edge_group;
     std::vector<u8>  alive;
@@ -98,17 +183,29 @@ struct t2_state {
     u32 same_stamp = no_pos, same_state = no_pos;
     std::vector<u32> born_states;
     u32 free_head = no_pos;
+    bool distributed = false;
+    pair_index by_key;
+    const std::vector<std::string>* shared_vocab = nullptr;
+    std::vector<u32> dirty_states;
 };
 
 bool queue_cmp::operator()(const queue_entry& a, const queue_entry& b) const {
     if (a.count != b.count) return a.count < b.count;
     if (a.fingerprint != b.fingerprint) return a.fingerprint > b.fingerprint;
+    const auto& vocab = s->shared_vocab ? *s->shared_vocab : s->vocab;
     const pair_state& pa = s->pair_states[a.state];
     const pair_state& pb = s->pair_states[b.state];
-    const std::string ta = s->vocab[pair_left(pa.key)]  + s->vocab[pair_right(pa.key)];
-    const std::string tb = s->vocab[pair_left(pb.key)]  + s->vocab[pair_right(pb.key)];
-    const int cmp = std::strcmp(ta.c_str(), tb.c_str());
-    if (cmp != 0) return cmp > 0;
+    const auto& al = vocab[pair_left(pa.key)];
+    const auto& ar = vocab[pair_right(pa.key)];
+    const auto& bl = vocab[pair_left(pb.key)];
+    const auto& br = vocab[pair_right(pb.key)];
+    const std::size_t an = al.size() + ar.size(), bn = bl.size() + br.size();
+    for (std::size_t i = 8; i < std::min(an, bn); ++i) {
+        const auto ac = static_cast<u8>(i < al.size() ? al[i] : ar[i - al.size()]);
+        const auto bc = static_cast<u8>(i < bl.size() ? bl[i] : br[i - bl.size()]);
+        if (ac != bc) return ac > bc;
+    }
+    if (an != bn) return an > bn;
     return pa.key > pb.key;
 }
 
@@ -116,13 +213,26 @@ bool queue_cmp::operator()(const queue_entry& a, const queue_entry& b) const {
 
 bool is_live(const t2_state& s, u32 p) { return p != no_pos && s.alive[p] != 0; }
 
+void mark_dirty(t2_state& s, u32 id) {
+    if (s.distributed && !s.pair_states[id].dirty) {
+        s.pair_states[id].dirty = true;
+        s.dirty_states.push_back(id);
+    }
+}
+
 u32 create_ps(t2_state& s, u64 key) {
     u32 id = static_cast<u32>(s.pair_states.size());
     s.pair_states.push_back({});
     auto& ps = s.pair_states.back();
     ps.key = key;
-    ps.fingerprint = text_fingerprint(s.vocab[pair_left(key)], s.vocab[pair_right(key)]);
+    if (!s.distributed) {
+        const auto& vocab = s.shared_vocab ? *s.shared_vocab : s.vocab;
+        ps.fingerprint = text_fingerprint(vocab[pair_left(key)], vocab[pair_right(key)]);
+    }
     s.born_states.push_back(id);
+    if (s.distributed) {
+        mark_dirty(s, id);
+    }
     return id;
 }
 
@@ -157,6 +267,7 @@ u32 get_word_group(t2_state& s, u32 sid, u32 word) {
 void remove_edge(t2_state& s, u32 start, u64 freq) {
     u32 g = s.edge_group[start];
     if (g==no_pos || s.group_count[g]==0) std::abort();
+    mark_dirty(s, s.group_state[g]);
     auto& ps = s.pair_states[s.group_state[g]];
     --s.group_count[g]; ps.count -= freq;
     if (s.group_count[g]==0) {
@@ -168,6 +279,7 @@ void remove_edge(t2_state& s, u32 start, u64 freq) {
 }
 
 void add_edge(t2_state& s, u32 start, u32 sid, u32 word, u64 freq) {
+    mark_dirty(s, sid);
     u32 g = get_word_group(s, sid, word);
     auto& ps = s.pair_states[sid];
     if (s.group_count[g]++==0) ++ps.word_count;
@@ -203,16 +315,17 @@ u32 pop_best(t2_state& s, queue_heap& q) {
 
 // ---- three phases -----------------------------------------------------------
 
-void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
+void build_state(const std::vector<CharSplit>& splits, t2_state& s,
+                 std::size_t begin, std::size_t end) {
     if (splits.size() >= no_pos) throw std::length_error("too many distinct words");
 
     s.vocab.resize(kVocab);
     s.token_count.assign(kVocab, 0);
     for (u32 v = 1; v < kVocab; ++v) s.vocab[v].assign(1, static_cast<char>(v));
 
-    s.word_freq.reserve(splits.size());
+    s.word_freq.reserve(end - begin);
     std::size_t slots = 0;
-    for (const auto& sp : splits) slots += sp.chars.size()+1;
+    for (std::size_t w = begin; w < end; ++w) slots += splits[w].chars.size()+1;
     if (slots >= no_pos) throw std::length_error("too many byte positions");
 
     s.token.reserve(slots); s.prev.reserve(slots); s.next.reserve(slots);
@@ -220,8 +333,8 @@ void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
     s.group_state.reserve(slots); s.group_count.reserve(slots);
 
     std::vector<u32> init(kVocab*kVocab, no_pos);
-    for (u32 w = 0; w < splits.size(); ++w) {
-        const auto& sp = splits[w];
+    for (u32 w = 0; w < end - begin; ++w) {
+        const auto& sp = splits[begin + w];
         s.word_freq.push_back(sp.count);
         u32 first = static_cast<u32>(s.token.size());
 
@@ -257,10 +370,42 @@ void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
             ++s.group_count[g]; ps.count+=sp.count; ps.positions.push_back(pos); s.edge_group[pos]=g;
         }
     }
-    s.born_states.clear();
+    if (!s.distributed) s.born_states.clear();
     std::size_t cache = s.vocab.size()+1024;
     s.left_stamp.assign(cache,no_pos); s.left_state.assign(cache,no_pos);
     s.right_stamp.assign(cache,no_pos); s.right_state.assign(cache,no_pos);
+}
+
+void merge_pair(t2_state& s, u64 key, u32 sel, u32 mt = no_pos) {
+    absl::InlinedVector<u32, 2> positions;
+    if (sel != no_pos) positions = std::move(s.pair_states[sel].positions);
+    u32 lt=pair_left(key), rt=pair_right(key);
+    if (mt == no_pos) {
+        mt = static_cast<u32>(s.vocab.size());
+        s.vocab.push_back(s.vocab[lt] + s.vocab[rt]);
+    }
+    s.token_count.push_back(0);
+    if (s.left_stamp.size()<=mt) {
+        std::size_t ns=std::max<std::size_t>(s.left_stamp.size()*2, mt+1024);
+        s.left_stamp.resize(ns,no_pos); s.left_state.resize(ns,no_pos);
+        s.right_stamp.resize(ns,no_pos); s.right_state.resize(ns,no_pos);
+    }
+    u32 cw=no_pos; u64 freq=0;
+    for (u32 pos : positions) {
+        if (!pair_is_at(s,pos,lt,rt)) continue;
+        u32 rp=s.next[pos], w=s.word_of[pos];
+        if (w!=cw) { cw=w; freq=s.word_freq[w]; }
+        u32 lp=s.prev[pos], ap=s.next[rp];
+        if (is_live(s,lp)) remove_edge(s,lp,freq);
+        remove_edge(s,pos,freq);
+        if (is_live(s,ap)) remove_edge(s,rp,freq);
+        s.token_count[lt]-=freq; s.token_count[rt]-=freq; s.token_count[mt]+=freq;
+        s.token[pos]=mt; s.alive[rp]=0; s.next[pos]=ap;
+        if (ap!=no_pos) s.prev[ap]=pos;
+        s.prev[rp]=no_pos; s.next[rp]=no_pos; s.edge_group[rp]=no_pos;
+        if (is_live(s,lp)) add_edge(s,lp,get_left_ps(s,s.token[lp],mt),w,freq);
+        if (is_live(s,ap)) add_edge(s,pos,get_right_ps(s,mt,s.token[ap]),w,freq);
+    }
 }
 
 void run_merge_loop(t2_state& s) {
@@ -284,36 +429,7 @@ void run_merge_loop(t2_state& s) {
         }
         if (batch.empty()) break;
 
-        for (u32 sel : batch) {
-            u64 key = s.pair_states[sel].key;
-            std::vector<u32> positions = std::move(s.pair_states[sel].positions);
-            u32 lt=pair_left(key), rt=pair_right(key);
-            u32 mt=static_cast<u32>(s.vocab.size());
-            std::string merged; merged.reserve(s.vocab[lt].size()+s.vocab[rt].size());
-            merged.append(s.vocab[lt]); merged.append(s.vocab[rt]);
-            s.vocab.push_back(std::move(merged)); s.token_count.push_back(0);
-            if (s.left_stamp.size()<=mt) {
-                std::size_t ns=std::max<std::size_t>(s.left_stamp.size()*2, mt+1024);
-                s.left_stamp.resize(ns,no_pos); s.left_state.resize(ns,no_pos);
-                s.right_stamp.resize(ns,no_pos); s.right_state.resize(ns,no_pos);
-            }
-            u32 cw=no_pos; u64 freq=0;
-            for (u32 pos : positions) {
-                if (!pair_is_at(s,pos,lt,rt)) continue;
-                u32 rp=s.next[pos], w=s.word_of[pos];
-                if (w!=cw) { cw=w; freq=s.word_freq[w]; }
-                u32 lp=s.prev[pos], ap=s.next[rp];
-                if (is_live(s,lp)) remove_edge(s,lp,freq);
-                remove_edge(s,pos,freq);
-                if (is_live(s,ap)) remove_edge(s,rp,freq);
-                s.token_count[lt]-=freq; s.token_count[rt]-=freq; s.token_count[mt]+=freq;
-                s.token[pos]=mt; s.alive[rp]=0; s.next[pos]=ap;
-                if (ap!=no_pos) s.prev[ap]=pos;
-                s.prev[rp]=no_pos; s.next[rp]=no_pos; s.edge_group[rp]=no_pos;
-                if (is_live(s,lp)) add_edge(s,lp,get_left_ps(s,s.token[lp],mt),w,freq);
-                if (is_live(s,ap)) add_edge(s,pos,get_right_ps(s,mt,s.token[ap]),w,freq);
-            }
-        }
+        for (u32 sel : batch) merge_pair(s, s.pair_states[sel].key, sel);
         push_born(s, q);
     }
 }
@@ -335,6 +451,173 @@ void finalize_results(const t2_state& s, Results& results) {
     }
 }
 
+struct pair_delta {
+    u64 key;
+    u64 count;
+    u64 words;
+};
+static_assert(sizeof(pair_delta) == 3 * sizeof(u64), "packed MPI delta");
+
+void collect_changes(t2_state& s, std::vector<pair_delta>& changes) {
+    for (u32 id : s.born_states)
+        if (s.pair_states[id].word_count != 0)
+            s.by_key.insert(s.pair_states[id].key, id);
+    changes.clear();
+    changes.reserve(s.dirty_states.size());
+    for (u32 id : s.dirty_states) {
+        auto& ps = s.pair_states[id];
+        const u64 dc = ps.count - ps.sent_count;
+        const u64 dw = static_cast<u64>(ps.word_count) - ps.sent_word_count;
+        if (dc != 0 || dw != 0) changes.push_back({ps.key, dc, dw});
+        ps.sent_count = ps.count;
+        ps.sent_word_count = ps.word_count;
+        ps.dirty = false;
+    }
+    s.dirty_states.clear();
+    s.born_states.clear();
+}
+
+void exchange_changes(const std::vector<std::vector<pair_delta>>& changes,
+                      std::vector<pair_delta>& received, int rank, int nranks) {
+    std::vector<pair_delta> local;
+    std::size_t total = 0;
+    for (const auto& part : changes) total += part.size();
+    local.reserve(total);
+    for (const auto& part : changes)
+        local.insert(local.end(), part.begin(), part.end());
+#ifdef BPE_HAVE_MPI
+    if (nranks > 1) {
+        int too_large = total > static_cast<std::size_t>(INT_MAX) / 3;
+        int any_large = 0;
+        MPI_Allreduce(&too_large, &any_large, 1, MPI_INT, MPI_MAX,
+                      MPI_COMM_WORLD);
+        if (any_large) throw std::length_error("task2 delta message too large");
+        int count = static_cast<int>(total * 3);
+        std::vector<int> counts(nranks), offsets(nranks);
+        MPI_Gather(&count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
+                   MPI_COMM_WORLD);
+        std::size_t size = 0;
+        if (rank == 0) {
+            for (int r = 0; r < nranks; ++r) {
+                offsets[r] = static_cast<int>(size);
+                size += counts[r];
+            }
+            too_large = size > INT_MAX;
+        }
+        MPI_Bcast(&too_large, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (too_large) throw std::length_error("task2 gathered deltas too large");
+        received.resize(size / 3);
+        MPI_Gatherv(local.data(), count, MPI_UINT64_T, received.data(),
+                    counts.data(), offsets.data(), MPI_UINT64_T, 0,
+                    MPI_COMM_WORLD);
+        return;
+    }
+#else
+    (void)rank;
+    (void)nranks;
+#endif
+    received.swap(local);
+}
+
+void run_distributed_loop(std::vector<t2_state>& workers, int rank, int nranks) {
+    t2_state global;
+    global.shared_vocab = &workers.front().vocab;
+    queue_heap queue;
+    queue.comp.s = &global;
+    std::vector<std::vector<pair_delta>> changes(workers.size());
+    std::vector<pair_delta> received;
+    std::vector<u64> batch;
+    pair_index newborn_index;
+    std::vector<pair_delta> newborn;
+    u32 first_new_token = 0;
+    const int nworkers = static_cast<int>(workers.size());
+    std::vector<std::exception_ptr> errors(nworkers);
+
+    using clock = std::chrono::steady_clock;
+    double collect_ms = 0, exchange_ms = 0, select_ms = 0, apply_ms = 0;
+    std::size_t rounds = 0, updates = 0;
+    auto add_time = [](double& total, clock::time_point start) {
+        total += std::chrono::duration<double, std::milli>(clock::now() - start).count();
+    };
+    for (;;) {
+        auto stage = clock::now();
+#pragma omp parallel for num_threads(nworkers) schedule(static)
+        for (int w = 0; w < nworkers; ++w)
+            collect_changes(workers[w], changes[w]);
+        add_time(collect_ms, stage); stage = clock::now();
+        exchange_changes(changes, received, rank, nranks);
+        add_time(exchange_ms, stage); stage = clock::now();
+        updates += received.size();
+        batch.clear();
+        if (rank == 0) {
+            newborn_index.clear();
+            newborn.clear();
+            for (const auto& d : received) {
+                if (pair_left(d.key) >= first_new_token ||
+                    pair_right(d.key) >= first_new_token) {
+                    u32 id = newborn_index.find(d.key);
+                    if (id == no_pos) {
+                        id = static_cast<u32>(newborn.size());
+                        newborn_index.insert(d.key, id);
+                        newborn.push_back({d.key, 0, 0});
+                    }
+                    newborn[id].count += d.count;
+                    newborn[id].words += d.words;
+                } else {
+                    u32 id = global.by_key.find(d.key);
+                    if (id == no_pos) continue;
+                    auto& ps = global.pair_states[id];
+                    ps.count += d.count;
+                    ps.word_count = static_cast<u32>(ps.word_count + d.words);
+                }
+            }
+            for (const auto& d : newborn) {
+                if (d.words < 2 || d.count == 0) continue;
+                u32 id = create_ps(global, d.key);
+                global.by_key.insert(d.key, id);
+                global.pair_states[id].count = d.count;
+                global.pair_states[id].word_count = static_cast<u32>(d.words);
+            }
+            push_born(global, queue);
+            while (batch.size() < kBudget) {
+                u32 best = pop_best(global, queue);
+                if (best == no_pos) break;
+                batch.push_back(global.pair_states[best].key);
+            }
+        }
+#ifdef BPE_HAVE_MPI
+        if (nranks > 1) {
+            int size = static_cast<int>(batch.size());
+            MPI_Bcast(&size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            batch.resize(size);
+            MPI_Bcast(batch.data(), size, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        }
+#endif
+        add_time(select_ms, stage); stage = clock::now();
+        if (batch.empty()) break;
+        ++rounds;
+        auto& vocab = workers.front().vocab;
+        const u32 first_token = static_cast<u32>(vocab.size());
+        first_new_token = first_token;
+        for (u64 key : batch) vocab.push_back(vocab[pair_left(key)] + vocab[pair_right(key)]);
+#pragma omp parallel for num_threads(nworkers) schedule(static)
+        for (int w = 0; w < nworkers; ++w) {
+            try {
+                auto& s = workers[w];
+                for (std::size_t i = 0; i < batch.size(); ++i)
+                    merge_pair(s, batch[i], s.by_key.find(batch[i]),
+                               first_token + static_cast<u32>(i));
+            } catch (...) { errors[w] = std::current_exception(); }
+        }
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+        add_time(apply_ms, stage);
+    }
+    LOG(INFO) << "task2 rounds: " << rounds << "; collect: " << collect_ms
+              << " ms; exchange: " << exchange_ms << " ms; select: " << select_ms
+              << " ms; apply: " << apply_ms << " ms; updates: " << updates
+              << "; global states: " << global.pair_states.size();
+}
+
 // ---- timing -----------------------------------------------------------------
 
 std::int64_t elapsed_ms(const std::chrono::steady_clock::time_point& a,
@@ -350,9 +633,13 @@ void write_timing_task2(int rank, int nranks,
 
 #ifdef BPE_HAVE_MPI
     std::vector<std::int64_t> all_times(nranks * NSTEPS);
-    MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
-               all_times.data(), NSTEPS, MPI_INT64_T,
-               0, MPI_COMM_WORLD);
+    if (nranks > 1) {
+        MPI_Gather(local_times.data(), NSTEPS, MPI_INT64_T,
+                   all_times.data(), NSTEPS, MPI_INT64_T,
+                   0, MPI_COMM_WORLD);
+    } else {
+        all_times = local_times;
+    }
 #else
     (void)rank; (void)nranks;
     const std::vector<std::int64_t>& all_times = local_times;
@@ -388,21 +675,71 @@ void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
     const int nranks = 1;
 #endif
 
+    int nworkers = configure_parallel_threads(rank, nranks);
+    nworkers = std::max(1, std::min(nworkers, static_cast<int>(
+        std::min<std::size_t>(splits.size(), INT_MAX))));
+    std::vector<int> counts(nranks, nworkers);
+#ifdef BPE_HAVE_MPI
+    if (nranks > 1)
+        MPI_Allgather(&nworkers, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                      MPI_COMM_WORLD);
+#endif
+    int total_workers = 0, first_worker = 0;
+    for (int r = 0; r < nranks; ++r) {
+        if (r < rank) first_worker += counts[r];
+        total_workers += counts[r];
+    }
     std::vector<std::int64_t> step_ms(3, 0);
-
-    t2_state state;
-
     auto tp = std::chrono::steady_clock::now();
-    build_state(splits, state);
+    std::vector<std::size_t> prefix(splits.size() + 1, 0);
+    for (std::size_t w = 0; w < splits.size(); ++w) {
+        prefix[w + 1] = prefix[w] + splits[w].chars.size() + 1;
+        if (std::find(splits[w].chars.begin(), splits[w].chars.end(), Byte(0))
+            != splits[w].chars.end()) throw std::invalid_argument("NUL byte in word");
+    }
+    auto boundary = [&](int worker) {
+        if (worker == total_workers) return splits.size();
+        const std::size_t target = prefix.back() / total_workers * worker +
+            (prefix.back() % total_workers) * worker / total_workers;
+        return static_cast<std::size_t>(std::lower_bound(prefix.begin(),
+                                     prefix.end(), target) - prefix.begin());
+    };
+    std::vector<t2_state> workers(nworkers);
+    std::vector<std::exception_ptr> errors(nworkers);
+#pragma omp parallel for num_threads(nworkers) schedule(static)
+    for (int w = 0; w < nworkers; ++w) {
+        try {
+            workers[w].distributed = total_workers > 1;
+            build_state(splits, workers[w], boundary(first_worker + w),
+                        boundary(first_worker + w + 1));
+        } catch (...) { errors[w] = std::current_exception(); }
+    }
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
     step_ms[0] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 build_state: " << step_ms[0] << " ms";
+    LOG(INFO) << "task2 workers: " << nworkers << "; MPI rank " << rank
+              << " of " << nranks;
 
     tp = std::chrono::steady_clock::now();
-    run_merge_loop(state);
+    if (total_workers == 1) run_merge_loop(workers.front());
+    else run_distributed_loop(workers, rank, nranks);
     step_ms[1] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 merge_loop: " << step_ms[1] << " ms";
 
     tp = std::chrono::steady_clock::now();
+    auto& state = workers.front();
+    for (int w = 1; w < nworkers; ++w)
+        for (std::size_t t = 0; t < state.token_count.size(); ++t)
+            state.token_count[t] += workers[w].token_count[t];
+#ifdef BPE_HAVE_MPI
+    if (nranks > 1) {
+        if (state.token_count.size() > INT_MAX)
+            throw std::length_error("task2 token count message too large");
+        MPI_Allreduce(MPI_IN_PLACE, state.token_count.data(),
+                      static_cast<int>(state.token_count.size()), MPI_UINT64_T,
+                      MPI_SUM, MPI_COMM_WORLD);
+    }
+#endif
     finalize_results(state, results);
     step_ms[2] = elapsed_ms(tp, std::chrono::steady_clock::now());
     LOG(INFO) << "task2 finalize: " << step_ms[2] << " ms";
