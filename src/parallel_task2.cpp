@@ -199,23 +199,38 @@ void build_state(const std::vector<CharSplit>& splits, t2_state& s) {
 struct GP { u64 key, cnt, fp; };  // candidate pair for selection
 
 void run_merge_loop_parallel(t2_state& state, int nranks) {
+    (void)nranks;  // used only under BPE_HAVE_MPI
     // Build key → local pair_state id map.
     std::unordered_map<u64, u32> key_to_id;
     key_to_id.reserve(state.pair_states.size() * 2);
     for (u32 id = 0; id < static_cast<u32>(state.pair_states.size()); ++id)
         key_to_id[state.pair_states[id].key] = id;
 
+    // Track only live pair_state IDs to avoid scanning dead pairs every round.
+    // pair_states only grows; dead entries (count==0) are dropped from live_ids.
+    std::vector<u32> live_ids;
+    live_ids.reserve(state.pair_states.size());
+    for (u32 id = 0; id < static_cast<u32>(state.pair_states.size()); ++id)
+        live_ids.push_back(id);
+
     for (;;) {
         // 1. Pack local active pairs as triples: (key, count, word_count).
+        //    Simultaneously rebuild live_ids, dropping dead entries.
         std::vector<u64> local_buf;
-        for (const auto& ps : state.pair_states) {
+        std::vector<u32> next_live;
+        next_live.reserve(live_ids.size());
+        for (u32 id : live_ids) {
+            const auto& ps = state.pair_states[id];
             if (ps.count > 0 && ps.word_count > 0) {
                 local_buf.push_back(ps.key);
                 local_buf.push_back(ps.count);
                 local_buf.push_back(static_cast<u64>(ps.word_count));
+                next_live.push_back(id);
             }
         }
+        live_ids = std::move(next_live);
         int local_n = static_cast<int>(local_buf.size());
+        (void)local_n;  // used only under BPE_HAVE_MPI
 
         // 2. Allgatherv all pairs.
         std::vector<u64> all_buf;
@@ -336,9 +351,11 @@ void run_merge_loop_parallel(t2_state& state, int nranks) {
             }
         }
 
-        // Register newly born pair_states (created during merges above).
-        for (u32 id : state.born_states)
+        // Register newly born pair_states and add them to live_ids.
+        for (u32 id : state.born_states) {
             key_to_id[state.pair_states[id].key] = id;
+            live_ids.push_back(id);
+        }
         state.born_states.clear();
     }
 }
