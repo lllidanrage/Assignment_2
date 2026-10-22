@@ -17,6 +17,9 @@
 #endif
 
 namespace bpe {
+
+int configure_parallel_threads(int rank, int nranks);
+
 namespace {
 
 std::int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start,
@@ -174,6 +177,8 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
     const int nranks = 1;
 #endif
 
+    configure_parallel_threads(rank, nranks);
+
     // per-step wall times: scatter/split/count/allgather/merge/sort/allgather2/build
     std::vector<std::int64_t> step_ms(8, 0);
 
@@ -240,6 +245,7 @@ void parallel_task1(std::vector<Byte>& input, Results& results) {
 #pragma omp single
         nthreads = omp_get_num_threads();
     }
+    LOG(INFO) << "task1 workers: " << nthreads << "; MPI rank " << rank;
 
     std::vector<std::unordered_map<std::string, std::size_t>> tmaps(nthreads);
 

@@ -23,9 +23,8 @@
 #endif
 
 namespace bpe {
-namespace {
 
-inline int configure_parallel_threads(int rank, int nranks) {
+int configure_parallel_threads(int rank, int nranks) {
 #ifdef BPE_HAVE_MPI
     const char* tuple = std::getenv("BPE_THREADS");
     if (tuple != nullptr && *tuple != '\0') {
@@ -54,6 +53,8 @@ inline int configure_parallel_threads(int rank, int nranks) {
 #endif
     return omp_get_max_threads();
 }
+
+namespace {
 
 // ---- types (mirror task2.cpp) -----------------------------------------------
 
